@@ -1,0 +1,12 @@
+build/
+cmake-build-*/
+.idea/
+*.o
+*.obj
+*.a
+*.so
+*.vpk
+*.velf
+*.elf
+*.bin
+.DS_Store

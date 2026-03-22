@@ -1,0 +1,6 @@
+[submodule "external/fceux"]
+	path = external/fceux
+	url = https://github.com/TASEmulators/fceux.git
+[submodule "external/libcross2d"]
+	path = external/libcross2d
+	url = https://github.com/Cpasjuste/libcross2d.git
