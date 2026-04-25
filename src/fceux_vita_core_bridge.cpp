@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <zlib.h>
+#include <zstd.h>
 #include <SDL.h>
 #include <archive.h>
 #include <archive_entry.h>
@@ -164,43 +165,100 @@ bool is_raw_binding_pressed(const Input::Player &player, int binding) {
 }
 
 // ---------------------------------------------------------------------------
-// Lightweight rewind ring buffer
-// Saves compressed savestates every frame into a fixed-size ring buffer.
-// During rewind: loads previous states, emulates one frame forward for audio.
+// Rewind ring buffer (zstd-compressed)
+//
+// Each slot stores an FCEUX savestate produced uncompressed by FCEUSS_SaveMS,
+// then run through zstd at a fast negative level. Saves happen every
+// REWIND_SAVE_INTERVAL game frames, so 20s of coverage at 60fps fits in
+// REWIND_BUF_SIZE slots (each ~25-40KB compressed). During rewind, each
+// displayed frame consumes one slot and steps REWIND_SAVE_INTERVAL game
+// frames into the past, giving a natural fast-rewind feel.
 // ---------------------------------------------------------------------------
 constexpr int REWIND_SECONDS = 20;
 constexpr int REWIND_FPS = 60;
-constexpr int REWIND_BUF_SIZE = REWIND_SECONDS * REWIND_FPS; // 1200 slots
+constexpr int REWIND_SAVE_INTERVAL = 1;
+constexpr int REWIND_BUF_SIZE = (REWIND_SECONDS * REWIND_FPS) / REWIND_SAVE_INTERVAL;
+constexpr int REWIND_ZSTD_LEVEL = -5;
+constexpr size_t REWIND_SCRATCH_RESERVE = 96 * 1024;
+constexpr size_t REWIND_SLOT_RESERVE = 48 * 1024;
 
 struct RewindBuffer {
     struct Slot {
-        std::vector<uint8_t> data;
+        std::vector<u8> data;
+        size_t uncompressed_size = 0;
         bool valid = false;
     };
 
     Slot slots[REWIND_BUF_SIZE];
-    int head = 0;   // next write position
-    int count = 0;  // number of valid entries
+    std::vector<u8> scratch;             // uncompressed [FCSX header + state]
+    std::vector<u8> compressed_scratch;  // zstd output staging
+    int head = 0;
+    int count = 0;
+    int save_skip = 0;
+    ZSTD_CCtx *cctx = nullptr;
+    ZSTD_DCtx *dctx = nullptr;
+
+    RewindBuffer() {
+        scratch.reserve(REWIND_SCRATCH_RESERVE);
+        compressed_scratch.reserve(REWIND_SCRATCH_RESERVE);
+        for (auto &s : slots) {
+            s.data.reserve(REWIND_SLOT_RESERVE);
+        }
+    }
+
+    ~RewindBuffer() {
+        if (cctx) ZSTD_freeCCtx(cctx);
+        if (dctx) ZSTD_freeDCtx(dctx);
+    }
+
+    bool ensure_contexts() {
+        if (!cctx) cctx = ZSTD_createCCtx();
+        if (!dctx) dctx = ZSTD_createDCtx();
+        return cctx != nullptr && dctx != nullptr;
+    }
 
     void reset() {
         head = 0;
         count = 0;
+        save_skip = 0;
         for (auto &s : slots) {
             s.valid = false;
+            s.uncompressed_size = 0;
             s.data.clear();
         }
     }
 
-    void save_state() {
-        EMUFILE_MEMORY em(0x4000);
-        if (!FCEUSS_SaveMS(&em, Z_BEST_SPEED)) {
-            return;
+    bool should_save_this_frame() {
+        if (save_skip > 0) {
+            save_skip--;
+            return false;
         }
+        save_skip = REWIND_SAVE_INTERVAL - 1;
+        return true;
+    }
+
+    void save_state() {
+        if (!should_save_this_frame()) return;
+        if (!ensure_contexts()) return;
+
+        scratch.clear();
+        EMUFILE_MEMORY em(&scratch);
+        if (!FCEUSS_SaveMS(&em, Z_NO_COMPRESSION)) return;
+
+        const size_t src_size = scratch.size();
+        if (src_size == 0) return;
+
+        const size_t cap = ZSTD_compressBound(src_size);
+        if (compressed_scratch.size() < cap) compressed_scratch.resize(cap);
+
+        const size_t out = ZSTD_compressCCtx(cctx, compressed_scratch.data(), cap,
+                                              scratch.data(), src_size,
+                                              REWIND_ZSTD_LEVEL);
+        if (ZSTD_isError(out)) return;
 
         Slot &slot = slots[head];
-        const size_t sz = em.size();
-        slot.data.resize(sz);
-        memcpy(slot.data.data(), em.buf(), sz);
+        slot.data.assign(compressed_scratch.data(), compressed_scratch.data() + out);
+        slot.uncompressed_size = src_size;
         slot.valid = true;
 
         head = (head + 1) % REWIND_BUF_SIZE;
@@ -210,6 +268,7 @@ struct RewindBuffer {
     // Load the most recent state and pop it. Returns false if empty.
     bool load_prev() {
         if (count <= 1) return false; // keep at least 1 so we can resume
+        if (!ensure_contexts()) return false;
 
         // Move head back to the last written slot
         head = (head - 1 + REWIND_BUF_SIZE) % REWIND_BUF_SIZE;
@@ -218,9 +277,20 @@ struct RewindBuffer {
         // The slot to load is one before current head (the previous frame)
         int idx = (head - 1 + REWIND_BUF_SIZE) % REWIND_BUF_SIZE;
         Slot &slot = slots[idx];
-        if (!slot.valid || slot.data.empty()) return false;
+        if (!slot.valid || slot.data.empty() || slot.uncompressed_size == 0) {
+            return false;
+        }
 
-        EMUFILE_MEMORY em(slot.data.data(), slot.data.size());
+        if (scratch.size() < slot.uncompressed_size) {
+            scratch.resize(slot.uncompressed_size);
+        }
+        const size_t out = ZSTD_decompressDCtx(dctx, scratch.data(), slot.uncompressed_size,
+                                                slot.data.data(), slot.data.size());
+        if (ZSTD_isError(out) || out != slot.uncompressed_size) return false;
+
+        // EMUFILE_MEMORY reads len = vec.size(); shrink so LoadFP sees only payload.
+        scratch.resize(slot.uncompressed_size);
+        EMUFILE_MEMORY em(&scratch);
         return FCEUSS_LoadFP(&em, SSLOADPARAM_NOBACKUP);
     }
 };
@@ -251,6 +321,19 @@ struct FceuxVitaCoreBridge::Impl {
     bool rewind_active = false;
     bool rewind_blocked_until_release = true;
     RewindBuffer rewind_buf;
+
+    // Cached config option pointers (populated in load(), refreshed when config
+    // is reloaded). Avoids per-frame O(N) lookups in Group::getOption.
+    c2d::config::Option *opt_rewind_enabled = nullptr;
+    c2d::config::Option *opt_frameskip = nullptr;
+    c2d::config::Option *opt_rewind_binding = nullptr;
+
+    void cache_config_options() {
+        auto *config = emu->getUi()->getConfig();
+        opt_rewind_enabled = config->get(PEMUConfig::OptId::EMU_REWIND, true);
+        opt_frameskip = config->get(PEMUConfig::OptId::EMU_FRAMESKIP, true);
+        opt_rewind_binding = config->get(PEMUConfig::OptId::JOY_REWIND, false);
+    }
 
     void set_last_error(const std::string &message) {
         last_error = message;
@@ -391,8 +474,7 @@ struct FceuxVitaCoreBridge::Impl {
     }
 
     int get_frameskip() const {
-        auto *opt = emu->getUi()->getConfig()->get(PEMUConfig::OptId::EMU_FRAMESKIP, true);
-        return opt ? std::clamp(opt->getInteger(), 0, 5) : 0;
+        return opt_frameskip ? std::clamp(opt_frameskip->getInteger(), 0, 5) : 0;
     }
 
     int next_frame_skip() {
@@ -412,8 +494,7 @@ struct FceuxVitaCoreBridge::Impl {
     }
 
     bool is_rewind_config_enabled() const {
-        auto *opt = emu->getUi()->getConfig()->get(PEMUConfig::OptId::EMU_REWIND, true);
-        return opt && opt->getInteger();
+        return opt_rewind_enabled && opt_rewind_enabled->getInteger();
     }
 
     void update_rewind_enabled() {
@@ -426,8 +507,7 @@ struct FceuxVitaCoreBridge::Impl {
     }
 
     int get_rewind_binding() const {
-        auto *opt = emu->getUi()->getConfig()->get(PEMUConfig::OptId::JOY_REWIND, false);
-        return opt ? opt->getInteger() : KEY_JOY_LT_DEFAULT;
+        return opt_rewind_binding ? opt_rewind_binding->getInteger() : KEY_JOY_LT_DEFAULT;
     }
 
     void suspend_hotkeys_until_release() {
@@ -616,6 +696,7 @@ int FceuxVitaCoreBridge::load(const std::string &full_path) {
     }
 
     m_impl->configure_from_settings();
+    m_impl->cache_config_options();
 
     if (!m_impl->load_rom(full_path)) {
         return -1;
