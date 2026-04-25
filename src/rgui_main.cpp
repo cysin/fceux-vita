@@ -194,6 +194,8 @@ void RguiMain::buildSettingsMenu() {
                       PEMUConfig::OptId::EMU_FILTER, false});
     items.push_back({"Frameskip", getOptionValue(PEMUConfig::OptId::EMU_FRAMESKIP),
                       PEMUConfig::OptId::EMU_FRAMESKIP, false});
+    items.push_back({"Rewind", getOptionValue(PEMUConfig::OptId::EMU_REWIND),
+                      PEMUConfig::OptId::EMU_REWIND, false});
 #ifdef __VITA__
     items.push_back({"Wait Rendering", getOptionValue(PEMUConfig::OptId::EMU_WAIT_RENDERING),
                       PEMUConfig::OptId::EMU_WAIT_RENDERING, false});

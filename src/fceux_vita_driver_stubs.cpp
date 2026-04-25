@@ -13,6 +13,7 @@
 #include "drivers/common/configSys.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -33,6 +34,7 @@ int32 fps_scale_frameadvance = 0;
 // ---------------------------------------------------------------------------
 static uint8 s_palette[256][3]; // RGB888
 uint16_t g_palette_rgb565[256]; // RGB565 lookup table
+uint32_t g_palette_rgb565_pair[256 * 256]; // two indexed pixels -> two RGB565 pixels
 
 void FCEUD_SetPalette(uint8 index, uint8 r, uint8 g, uint8 b) {
     s_palette[index][0] = r;
@@ -41,6 +43,14 @@ void FCEUD_SetPalette(uint8 index, uint8 r, uint8 g, uint8 b) {
     g_palette_rgb565[index] = (uint16_t)(((r & 0xF8) << 8) |
                                           ((g & 0xFC) << 3) |
                                           (b >> 3));
+
+    const uint32_t color = g_palette_rgb565[index];
+    for (int other = 0; other < 256; ++other) {
+        g_palette_rgb565_pair[index | (other << 8)] =
+            color | (static_cast<uint32_t>(g_palette_rgb565[other]) << 16);
+        g_palette_rgb565_pair[other | (index << 8)] =
+            static_cast<uint32_t>(g_palette_rgb565[other]) | (color << 16);
+    }
 }
 
 void FCEUD_GetPalette(uint8 i, uint8 *r, uint8 *g, uint8 *b) {

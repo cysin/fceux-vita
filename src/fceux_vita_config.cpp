@@ -29,7 +29,9 @@ FceuxVitaConfig::FceuxVitaConfig(Renderer *renderer, const int version)
     group->addOption({"AUDIO_FREQUENCY", {"22050", "44100", "48000"},
                       2, EMU_AUDIO_FREQ, C2D_CONFIG_RESTART_EMU_NEEDED});
     group->addOption({"FRAMESKIP", {"0", "1", "2", "3", "4", "5"},
-                      0, EMU_FRAMESKIP, C2D_CONFIG_RESTART_EMU_NEEDED});
+                      0, EMU_FRAMESKIP});
+    group->addOption({"REWIND", {"OFF", "ON"},
+                      0, EMU_REWIND});
 
     // Reload config so new rom paths are immediately visible
     PEMUConfig::load();

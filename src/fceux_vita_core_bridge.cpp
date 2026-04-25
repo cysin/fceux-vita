@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -50,6 +51,7 @@ using namespace pemu;
 
 // RGB565 palette LUT defined in driver stubs, updated by FCEUD_SetPalette
 extern uint16_t g_palette_rgb565[256];
+extern uint32_t g_palette_rgb565_pair[256 * 256];
 extern int dendy;
 
 namespace {
@@ -241,9 +243,11 @@ struct FceuxVitaCoreBridge::Impl {
     std::string tmp_rom_path;  // extracted archive ROM
     uint32 paddata[2] = {0, 0};
     int audio_rate = 48000;
+    int frame_skip_counter = 0;
     float target_fps = 60.0f;
     bool initialized = false;
     bool loaded = false;
+    bool rewind_enabled = false;
     bool rewind_active = false;
     bool rewind_blocked_until_release = true;
     RewindBuffer rewind_buf;
@@ -372,6 +376,7 @@ struct FceuxVitaCoreBridge::Impl {
     }
 
     void start_rewind() {
+        rewind_enabled = true;
         rewind_buf.reset();
         rewind_active = false;
         rewind_blocked_until_release = true;
@@ -380,8 +385,44 @@ struct FceuxVitaCoreBridge::Impl {
     }
 
     void stop_rewind() {
+        rewind_enabled = false;
         rewind_active = false;
         rewind_buf.reset();
+    }
+
+    int get_frameskip() const {
+        auto *opt = emu->getUi()->getConfig()->get(PEMUConfig::OptId::EMU_FRAMESKIP, true);
+        return opt ? std::clamp(opt->getInteger(), 0, 5) : 0;
+    }
+
+    int next_frame_skip() {
+        const int frameskip = get_frameskip();
+        if (frameskip <= 0) {
+            frame_skip_counter = 0;
+            return 0;
+        }
+
+        if (frame_skip_counter > frameskip) {
+            frame_skip_counter = 0;
+        }
+
+        const int skip = frame_skip_counter > 0 ? 1 : 0;
+        frame_skip_counter = (frame_skip_counter + 1) % (frameskip + 1);
+        return skip;
+    }
+
+    bool is_rewind_config_enabled() const {
+        auto *opt = emu->getUi()->getConfig()->get(PEMUConfig::OptId::EMU_REWIND, true);
+        return opt && opt->getInteger();
+    }
+
+    void update_rewind_enabled() {
+        const bool enabled = is_rewind_config_enabled();
+        if (enabled && !rewind_enabled) {
+            start_rewind();
+        } else if (!enabled && rewind_enabled) {
+            stop_rewind();
+        }
     }
 
     int get_rewind_binding() const {
@@ -431,10 +472,10 @@ struct FceuxVitaCoreBridge::Impl {
         if (!dst_pixels) return;
 
         for (int y = 0; y < height; ++y) {
-            auto *dst_row = reinterpret_cast<uint16_t *>(dst_pixels + y * pitch);
+            auto *dst_row = reinterpret_cast<uint32_t *>(dst_pixels + y * pitch);
             const uint8 *src_row = xbuf + (first_scanline + y) * 256;
-            for (int x = 0; x < width; ++x) {
-                dst_row[x] = g_palette_rgb565[src_row[x]];
+            for (int x = 0; x < width; x += 2) {
+                dst_row[x >> 1] = g_palette_rgb565_pair[src_row[x] | (src_row[x + 1] << 8)];
             }
         }
 
@@ -488,7 +529,9 @@ struct FceuxVitaCoreBridge::Impl {
     void exec_frame(Input::Player *players) {
         if (!loaded) return;
 
-        bool rewinding = players && check_rewind(players[0]);
+        update_rewind_enabled();
+
+        bool rewinding = rewind_enabled && players && check_rewind(players[0]);
 
         if (rewinding) {
             // Rewind: load previous state, then emulate one frame forward for audio
@@ -523,17 +566,21 @@ struct FceuxVitaCoreBridge::Impl {
             paddata[1] = 0;
         }
 
-        // Save state to rewind buffer before emulating
-        rewind_buf.save_state();
+        if (rewind_enabled) {
+            rewind_buf.save_state();
+        }
 
         // Run one frame
         uint8 *xbuf = nullptr;
         int32 *soundbuf = nullptr;
         int32 soundbufsize = 0;
-        FCEUI_Emulate(&xbuf, &soundbuf, &soundbufsize, 0);
+        const int skip = next_frame_skip();
+        FCEUI_Emulate(&xbuf, &soundbuf, &soundbufsize, skip);
 
         // Output video and audio
-        upload_video_frame(xbuf);
+        if (!skip) {
+            upload_video_frame(xbuf);
+        }
         push_audio(soundbuf, soundbufsize);
     }
 
@@ -575,10 +622,11 @@ int FceuxVitaCoreBridge::load(const std::string &full_path) {
     }
 
     m_impl->loaded = true;
+    m_impl->frame_skip_counter = 0;
     m_impl->setup_input();
     m_impl->build_video_surface();
     m_impl->configure_audio();
-    m_impl->start_rewind();
+    m_impl->update_rewind_enabled();
 
     return 0;
 }

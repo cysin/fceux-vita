@@ -61,6 +61,7 @@ namespace pemu {
             EMU_ROTATION,
             EMU_SHOW_FPS,
             EMU_FRAMESKIP,
+            EMU_REWIND,
             EMU_NEOBIOS,
             EMU_PSNES_CHEATS,
             EMU_PSNES_BLOCK_VRAM,
